@@ -80,6 +80,13 @@ st.session_state["utm_source"]   = q.get("utm_source",   [""])[0] if isinstance(
 st.session_state["utm_medium"]   = q.get("utm_medium",   [""])[0] if isinstance(q.get("utm_medium"), list) else q.get("utm_medium", "")
 st.session_state["utm_campaign"] = q.get("utm_campaign", [""])[0] if isinstance(q.get("utm_campaign"), list) else q.get("utm_campaign", "")
 
+# 管理者モード（?admin=1 でON、または Secrets の ADMIN_MODE="1"）
+try:
+    qp = st.query_params
+except Exception:
+    qp = st.experimental_get_query_params()
+ADMIN_MODE = (str(qp.get("admin", ["0"])[0]) == "1") or (str(read_secret("ADMIN_MODE", "0")) == "1")
+
 # ========= Secrets/環境変数 =========
 def read_secret(key: str, default=None):
     try:
@@ -245,24 +252,79 @@ def fallback_append_to_csv(row_dict: dict, csv_path="responses.csv"):
     else:
         df.to_csv(csv_path, index=False, encoding="utf-8")
 
-def auto_save_row(row: dict):
-    # 優先：SecretsのSheets設定 → 無ければCSV
+def _report_event(level: str, message: str, payload: dict | None = None):
+    """障害・警告を“管理者だけ”が後から確認できるように記録する。
+    優先: Google Sheets の 'events' ワークシート → 無ければ CSV(events.csv)
+    ※ 画面には何も出さない。ADMIN_MODE のときのみ通知表示。
+    """
+    evt = {
+        "timestamp": datetime.now(JST).isoformat(timespec="seconds"),
+        "level": level,
+        "message": message,
+        "payload": json.dumps(payload, ensure_ascii=False) if payload else ""
+    }
+
+    # まず Sheets 側に記録を試みる
     secret_json     = read_secret("GOOGLE_SERVICE_JSON", None)
     secret_sheet_id = read_secret("SPREADSHEET_ID", None)
+    wrote = False
+    try:
+        if secret_json and secret_sheet_id:
+            scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+            info = json.loads(secret_json)
+            creds = Credentials.from_service_account_info(info, scopes=scopes)
+            gc = gspread.authorize(creds)
+            sh = gc.open_by_key(secret_sheet_id)
+            try:
+                ws = sh.worksheet("events")
+            except gspread.WorksheetNotFound:
+                ws = sh.add_worksheet(title="events", rows=1000, cols=6)
+                ws.append_row(list(evt.keys()))
+            ws.append_row([evt[k] for k in evt.keys()])
+            wrote = True
+    except Exception:
+        wrote = False
+
+    # フォールバック：CSVに追記
+    if not wrote:
+        try:
+            df = pd.DataFrame([evt])
+            csv_path = "events.csv"
+            if os.path.exists(csv_path):
+                df.to_csv(csv_path, mode="a", header=False, index=False, encoding="utf-8")
+            else:
+                df.to_csv(csv_path, index=False, encoding="utf-8")
+        except Exception:
+            pass  # それでも無視（ユーザーには出さない）
+
+    # 管理者モードのときだけ画面に小さく知らせる
+    if ADMIN_MODE:
+        st.caption(f"［ADMIN］{level}: {message}")
+def auto_save_row(row: dict):
+    """ユーザーには何も表示しない。
+    - Sheets設定があれば Sheets に追記
+    - なければ CSV に追記
+    - いずれか失敗した場合：管理者ログ（events）に記録。画面表示はしない。
+    """
+    secret_json     = read_secret("GOOGLE_SERVICE_JSON", None)
+    secret_sheet_id = read_secret("SPREADSHEET_ID", None)
+
+    def _append_csv():
+        try:
+            fallback_append_to_csv(row)
+        except Exception as e2:
+            _report_event("ERROR", f"CSV保存に失敗: {e2}", {"row_head": {k: row.get(k) for k in list(row)[:6]}})
+
     try:
         if secret_json and secret_sheet_id:
             try_append_to_google_sheets(row, secret_sheet_id, secret_json)
-            st.info("診断ログをGoogle Sheetsに保存しました。")
         else:
-            fallback_append_to_csv(row)
-            st.info("診断ログをCSV（responses.csv）に保存しました。")
+            _append_csv()
     except Exception as e:
-        # 失敗時はCSVへフォールバック
-        try:
-            fallback_append_to_csv(row)
-            st.warning(f"Sheets保存に失敗したため、CSVに保存しました。詳細: {e}")
-        except Exception as e2:
-            st.error(f"ログ保存でエラーが発生しました: {e2}")
+        # Sheets失敗 → CSVへフォールバックも失敗ならイベント記録
+        _append_csv()
+        _report_event("WARN", f"Sheets保存に失敗しCSVへフォールバック: {e}", {"reason": str(e)})
+
 
 # ========= 図・QRユーティリティ =========
 def build_bar_png(df: pd.DataFrame) -> bytes:
@@ -583,6 +645,35 @@ if st.session_state.get("result_ready"):
 else:
     st.caption("フォームに回答し、「診断する」を押してください。")
 
+if ADMIN_MODE:
+    with st.expander("ADMIN：イベントログの確認（最新50件）"):
+        # Sheets優先
+        secret_json     = read_secret("GOOGLE_SERVICE_JSON", None)
+        secret_sheet_id = read_secret("SPREADSHEET_ID", None)
+        shown = False
+        try:
+            if secret_json and secret_sheet_id:
+                scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+                info = json.loads(secret_json)
+                creds = Credentials.from_service_account_info(info, scopes=scopes)
+                gc = gspread.authorize(creds)
+                sh = gc.open_by_key(secret_sheet_id)
+                ws = sh.worksheet("events")
+                values = ws.get_all_records()
+                if values:
+                    df_evt = pd.DataFrame(values).sort_values("timestamp", ascending=False).head(50)
+                    st.dataframe(df_evt, use_container_width=True)
+                    shown = True
+        except Exception:
+            pass
+        if not shown:
+            # CSVフォールバックの表示
+            import os
+            if os.path.exists("events.csv"):
+                df_evt = pd.read_csv("events.csv").sort_values("timestamp", ascending=False).head(50)
+                st.dataframe(df_evt, use_container_width=True)
+            else:
+                st.info("イベントログはまだありません。")
 
 
 
